@@ -1,5 +1,5 @@
 import express from "express";
-import { createClient } from "redis";
+import { createClient, WatchError } from "redis";
 import { json } from "body-parser";
 
 const DEFAULT_BALANCE = 100;
@@ -10,6 +10,7 @@ interface ChargeResult {
     charges: number;
 }
 
+
 async function connect(): Promise<ReturnType<typeof createClient>> {
     const url = `redis://${process.env.REDIS_HOST ?? "localhost"}:${process.env.REDIS_PORT ?? "6379"}`;
     console.log(`Using redis URL ${url}`);
@@ -19,6 +20,7 @@ async function connect(): Promise<ReturnType<typeof createClient>> {
 }
 
 async function reset(account: string): Promise<void> {
+    // This transaction can happen in parallel with other transactions, as it is a single operation and thus it is atomic
     const client = await connect();
     try {
         await client.set(`${account}/balance`, DEFAULT_BALANCE);
@@ -27,18 +29,43 @@ async function reset(account: string): Promise<void> {
     }
 }
 
+
 async function charge(account: string, charges: number): Promise<ChargeResult> {
     const client = await connect();
-    try {
-        const balance = parseInt((await client.get(`${account}/balance`)) ?? "");
-        if (balance >= charges) {
-            await client.set(`${account}/balance`, balance - charges);
-            const remainingBalance = parseInt((await client.get(`${account}/balance`)) ?? "");
-            return { isAuthorized: true, remainingBalance, charges };
-        } else {
-            return { isAuthorized: false, remainingBalance: balance, charges: 0 };
+    const retrials = 3;
+    try{
+        for(let i = 0; i < retrials; i++){
+            try {
+                // If the balance is changed by another transaction, the watch will fail and the transaction will be retried
+                await client.watch(`${account}/balance`);
+                const balanceString = await client.get(`${account}/balance`);
+                const balance = parseInt(balanceString ?? "");
+                if (balance >= charges) {
+                    // Although it is a single operation, we need the multi keyword for the watch to work
+                    const pipeline = client.multi();
+                    pipeline.decrBy(`${account}/balance`, charges);
+                    const replies: any = await pipeline.exec();
+                    if(replies){
+                        const remainingBalanceStr = replies[0];
+                        const remainingBalance = parseInt(remainingBalanceStr ?? "");
+                        return { isAuthorized: true, remainingBalance, charges };
+                    } else{
+                        throw new Error("Transaction failed");
+                    }
+                } else {
+                    return { isAuthorized: false, remainingBalance: balance, charges: 0 };
+                }
+            } catch(error: any){
+                // if the error is a WatchError, we ignore it
+                if(!(error instanceof WatchError)){
+                    console.error(error);
+                    throw error;
+                }
+            } 
         }
-    } finally {
+        throw new Error("Too many retries");
+    }
+    finally {
         await client.disconnect();
     }
 }
